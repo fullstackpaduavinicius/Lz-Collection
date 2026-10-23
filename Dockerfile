@@ -1,8 +1,22 @@
+
+
+
 FROM python:3.12-slim
+
 WORKDIR /app
-COPY server.py /app/
+
+COPY requirements.txt /app/requirements.txt
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY server.py /app/server.py
 COPY frontend/ /app/frontend/
+
 RUN mkdir -p /app/data /app/media
-ENV PORT=8000 PYTHONUNBUFFERED=1 LZ_DATA_DIR=/app/data LZ_MEDIA_DIR=/app/media
-EXPOSE 8000
+
+ENV PYTHONUNBUFFERED=1
+ENV PORT=10000
+
+EXPOSE 10000
+
 CMD ["python", "server.py"]
