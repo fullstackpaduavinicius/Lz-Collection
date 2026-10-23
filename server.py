@@ -2,7 +2,9 @@
 """LZ Collection: zero-dependency Python/SQLite storefront + owner-only admin API."""
 import os, re, sys, json, sqlite3, hashlib, hmac, secrets, base64, mimetypes, unicodedata, uuid, time, threading
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 
@@ -12,21 +14,151 @@ MEDIA = Path(os.environ.get('LZ_MEDIA_DIR', ROOT / 'media')).resolve()
 WEB = ROOT / 'frontend'
 DB = DATA / 'lz.sqlite3'
 MAX_BODY = 9 * 1024 * 1024
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
+STORAGE_BUCKET = os.environ.get('SUPABASE_STORAGE_BUCKET', 'lz-images')
+try:
+    from psycopg import IntegrityError as DatabaseIntegrityError
+except ImportError:
+    class DatabaseIntegrityError(Exception): pass
 DEFAULT_CATEGORIES = ['Calçados', 'Camisas', 'Calças', 'Bermudas', 'Shorts', 'Regatas', 'Dry Fit', 'UV']
 DATA.mkdir(parents=True, exist_ok=True); MEDIA.mkdir(parents=True, exist_ok=True)
 
+class HybridRow(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+class CursorAdapter:
+    def __init__(self, cursor): self.cursor = cursor
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return HybridRow(row) if row is not None else None
+    def fetchall(self): return [HybridRow(r) for r in self.cursor.fetchall()]
+    def __iter__(self):
+        for row in self.cursor: yield HybridRow(row)
+
+class PostgresConnection:
+    def __init__(self):
+        import psycopg
+        from psycopg.rows import dict_row
+        self.db = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=12)
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type: self.db.rollback()
+            else: self.db.commit()
+        finally: self.db.close()
+    def execute(self, sql, params=None):
+        # Original application uses SQLite's '?' parameter placeholders.
+        sql = sql.replace('?', '%s')
+        return CursorAdapter(self.db.execute(sql, params or ()))
+    def commit(self): self.db.commit()
+
 def con():
+    if DATABASE_URL:
+        return PostgresConnection()
     db=sqlite3.connect(str(DB), timeout=10)
     db.row_factory=sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
     db.execute('PRAGMA busy_timeout=10000')
     return db
 
+def storage_request(method, filename, data=None, content_type=None):
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        raise RuntimeError('Supabase Storage não configurado.')
+
+    url = (
+        f'{SUPABASE_URL}/storage/v1/object/'
+        f'{quote(STORAGE_BUCKET, safe="")}/'
+        f'{quote(filename, safe="")}'
+    )
+
+    headers = {
+        'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
+        'apikey': SUPABASE_SERVICE_ROLE_KEY
+    }
+
+    if content_type:
+        headers['Content-Type'] = content_type
+
+    request = Request(
+        url,
+        data=data,
+        headers=headers,
+        method=method
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            return response.read()
+
+    except HTTPError as exc:
+        error_body = exc.read().decode('utf-8', errors='replace')
+        print(f'SUPABASE STORAGE ERROR [{exc.code}]: {error_body}')
+        raise
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        raise RuntimeError('Supabase Storage não configurado.')
+    url = f'{SUPABASE_URL}/storage/v1/object/{quote(STORAGE_BUCKET, safe="")}/{quote(filename, safe="")}'
+    headers={'Authorization': 'Bearer '+SUPABASE_SERVICE_ROLE_KEY,
+             'apikey': SUPABASE_SERVICE_ROLE_KEY}
+    if content_type: headers['Content-Type']=content_type
+    request=Request(url, data=data, headers=headers, method=method)
+    try:
+     with urlopen(request, timeout=30) as response:
+            return response.read()
+    except HTTPError as exc:
+     error_body = exc.read().decode('utf-8', errors='replace')
+    print(f'SUPABASE STORAGE ERROR [{exc.code}]: {error_body}')
+    raise
+
+
 def slug(value):
     value=''.join(ch for ch in unicodedata.normalize('NFKD',str(value).lower()) if not unicodedata.combining(ch))
     return re.sub(r'-+','-',re.sub(r'[^a-z0-9]+','-',value)).strip('-') or 'produto'
 
 def init_db():
+    if DATABASE_URL:
+        with con() as db:
+            statements = [
+                "CREATE TABLE IF NOT EXISTS admins (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, admin_id TEXT NOT NULL REFERENCES admins(id) ON DELETE CASCADE, csrf TEXT NOT NULL, expires_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT PRIMARY KEY, failures INTEGER NOT NULL, retry_after BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS categories (id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT UNIQUE NOT NULL, slug TEXT UNIQUE NOT NULL, active INTEGER DEFAULT 1, sort_order INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '', image_url TEXT NOT NULL DEFAULT '')",
+                "CREATE TABLE IF NOT EXISTS products (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT UNIQUE NOT NULL, sku TEXT DEFAULT '', description TEXT DEFAULT '', price_cents INTEGER NOT NULL CHECK(price_cents>=0), sale_cents INTEGER CHECK(sale_cents IS NULL OR sale_cents>=0), category_id INTEGER REFERENCES categories(id), tags TEXT NOT NULL DEFAULT '[]', keywords TEXT DEFAULT '', images TEXT NOT NULL DEFAULT '[]', published INTEGER NOT NULL DEFAULT 0, featured INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS variants (id TEXT PRIMARY KEY, product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE, color TEXT DEFAULT '', size TEXT DEFAULT '', sku TEXT DEFAULT '', stock INTEGER NOT NULL DEFAULT 0 CHECK(stock>=0))",
+                "CREATE INDEX IF NOT EXISTS idx_products_public ON products(published, category_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_variants_product ON variants(product_id)",
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                "ALTER TABLE categories ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE categories ADD COLUMN IF NOT EXISTS image_url TEXT NOT NULL DEFAULT ''",
+            ]
+            for sql in statements: db.execute(sql)
+            for i,name in enumerate(DEFAULT_CATEGORIES):
+                db.execute('INSERT INTO categories(name,slug,sort_order) VALUES(?,?,?) ON CONFLICT DO NOTHING',(name,slug(name),i))
+            defaults = {
+                'whatsapp': '5579998932703',
+                'instagram': 'https://www.instagram.com/lz.collection__/',
+                'hero_title': 'Presença em cada detalhe.',
+                'hero_text': 'Uma curadoria de moda masculina para acompanhar a sua rotina e o seu estilo.',
+                'hero_eyebrow': 'LZ COLLECTION · MODA MASCULINA',
+                'hero_image': '',
+                'announcement': 'UMA CURADORIA PARA O SEU ESTILO',
+                'about': 'Estilo, versatilidade e personalidade em cada escolha.'
+            }
+
+            for k, v in defaults.items():
+                db.execute(
+                    'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT DO NOTHING',
+                    (k, v)
+                )
+
+        return
+    init_sqlite_db()
+
+def init_sqlite_db():
     with con() as db:
         db.executescript('''
         PRAGMA journal_mode=WAL;
@@ -105,7 +237,7 @@ def product_dict(db,row):
     p=dict(row)
     p['images']=json.loads(p['images'] or '[]')
     p['tags']=json.loads(p['tags'] or '[]')
-    p['variants']=[dict(r) for r in db.execute('SELECT id,color,size,sku,stock FROM variants WHERE product_id=? ORDER BY rowid',(p['id'],))]
+    p['variants']=[dict(r) for r in db.execute('SELECT id,color,size,sku,stock FROM variants WHERE product_id=? ORDER BY id',(p['id'],))]
     p['stock']=sum(v['stock'] for v in p['variants'])
     p['published']=bool(p['published']); p['featured']=bool(p['featured'])
     p['category']=rowdict(db.execute('SELECT id,name,slug FROM categories WHERE id=?',(p['category_id'],)).fetchone())
@@ -217,8 +349,15 @@ class Handler(BaseHTTPRequestHandler):
                 name=p.rsplit('/',1)[-1]
                 if not re.fullmatch(r'[a-f0-9]{32}\.(jpg|png|webp)',name): self.error_json(404,'Imagem não encontrada.');return
                 file=MEDIA/name
-                if not file.is_file():self.error_json(404,'Imagem não encontrada.');return
-                blob=file.read_bytes(); ctype=mimetypes.guess_type(name)[0] or 'application/octet-stream'
+                if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+                    try: blob=storage_request('GET', name)
+                    except HTTPError as exc:
+                        if exc.code == 404: self.error_json(404,'Imagem não encontrada.');return
+                        raise
+                else:
+                    if not file.is_file():self.error_json(404,'Imagem não encontrada.');return
+                    blob=file.read_bytes()
+                ctype=mimetypes.guess_type(name)[0] or 'application/octet-stream'
                 self.headers_base(ctype,len(blob),extra={'Cache-Control':'public, max-age=31536000, immutable'})
                 self.wfile.write(blob);return
             path=p.lstrip('/')
@@ -353,11 +492,14 @@ class Handler(BaseHTTPRequestHandler):
                     elif raw[:4]==b'RIFF' and raw[8:12]==b'WEBP':ext='webp'
                     else:raise ValueError('Formato inválido. Use JPG, PNG ou WebP.')
                     filename=uuid.uuid4().hex+'.'+ext
-                    (MEDIA/filename).write_bytes(raw)
+                    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+                        storage_request('POST', filename, raw, mimetypes.guess_type(filename)[0] or 'application/octet-stream')
+                    else:
+                        (MEDIA/filename).write_bytes(raw)
                     db.commit();self.out({'url':'/media/'+filename});return
                 self.error_json(404,'Operação não encontrada.')
         except (ValueError,TypeError,KeyError,OverflowError,base64.binascii.Error) as e:self.error_json(400,str(e))
-        except sqlite3.IntegrityError:self.error_json(409,'Conflito de dados. Revise as informações enviadas.')
+        except (sqlite3.IntegrityError, DatabaseIntegrityError):self.error_json(409,'Conflito de dados. Revise as informações enviadas.')
         except Exception as e:print('API ERROR:',repr(e),file=sys.stderr);self.error_json(500,'Erro interno no servidor.')
 
 if __name__=='__main__':
