@@ -1,0 +1,15 @@
+services:
+  lzcollection:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - LZ_SECURE_COOKIES=${LZ_SECURE_COOKIES:-0}
+    volumes:
+      - lz_data:/app/data
+      - lz_media:/app/media
+    restart: unless-stopped
+volumes:
+  lz_data:
+  lz_media:
